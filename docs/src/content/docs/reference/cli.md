@@ -233,10 +233,8 @@ Report those exceptions rather than describing Test as clean.
 `passed-with-skips` is a completed run where PR publication or CI verification automatically skipped because its provider was unavailable, or CI had no PR URL.
 It retains exit code 0: missing verification is not a failing code verdict.
 `run.automatic_skips` names each affected step and cause, and `run.head_sha` gives the full recorded head in both drive output and `axi status`.
-When Review has recorded an approval, those same documents also include `run.reviewed_head_sha`, the commit Review approved, and `run.head_reviewed` (`true` when `head_sha` is still that commit, `false` when a later step moved the head).
-Both fields are omitted when no approval is recorded.
-They report the stored fact and do not change what the pipeline does.
 Report that missing evidence; this outcome does not establish CI readiness or a merge.
+For the review-approved head fields shared by gate, outcome, and status documents, see [`axi status`](#no-mistakes-axi-status).
 Explicit per-run skips retain their existing behavior.
 If the run also has a Test or CI approval override, `passed-with-override` takes precedence and the automatic skip causes remain visible.
 Legacy rows without a recorded skip cause keep their prior classification; their logs remain inspectable.
