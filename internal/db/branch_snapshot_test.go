@@ -99,6 +99,14 @@ func TestGetBranchSnapshotReadsLegacyReportingColumnsWithoutMigration(t *testing
 	for _, statement := range []string{
 		`ALTER TABLE runs DROP COLUMN closing_issue_refs`,
 		`ALTER TABLE runs DROP COLUMN gates_json`,
+		`ALTER TABLE runs DROP COLUMN review_approved_head_sha`,
+		`ALTER TABLE runs DROP COLUMN last_pushed_sha`,
+		`ALTER TABLE runs DROP COLUMN push_target_kind`,
+		`ALTER TABLE runs DROP COLUMN push_target_fingerprint`,
+		`ALTER TABLE runs DROP COLUMN push_ref`,
+		`ALTER TABLE runs DROP COLUMN last_pushed_at`,
+		`ALTER TABLE runs DROP COLUMN push_generation`,
+		`ALTER TABLE runs DROP COLUMN push_active`,
 		`ALTER TABLE step_results DROP COLUMN override_reason`,
 		`ALTER TABLE step_results DROP COLUMN approval_reason`,
 		`ALTER TABLE step_results DROP COLUMN skip_reason`,
@@ -125,8 +133,83 @@ func TestGetBranchSnapshotReadsLegacyReportingColumnsWithoutMigration(t *testing
 	if items[0].Steps[0].ApprovalReason != nil || items[0].Steps[0].OverrideReason != nil || items[0].Steps[0].SkipReason != nil {
 		t.Fatal("legacy reason was fabricated")
 	}
-	if reader.hasColumn("runs", "closing_issue_refs") || reader.hasColumn("step_results", "approval_reason") {
+	r := items[0].Run
+	if r.ReviewApprovedHeadSHA != nil || r.LastPushedSHA != nil || r.PushTargetKind != nil || r.PushTargetFingerprint != nil || r.PushRef != nil || r.LastPushedAt != nil || r.PushGeneration != nil || r.PushActive || items[0].GatesJSON != "" {
+		t.Fatal("legacy provenance was fabricated")
+	}
+	if reader.hasColumn("runs", "review_approved_head_sha") || reader.hasColumn("runs", "last_pushed_sha") || reader.hasColumn("runs", "closing_issue_refs") || reader.hasColumn("step_results", "approval_reason") {
 		t.Fatal("read-only snapshot migrated storage")
+	}
+}
+
+// The inventory exceeds a typical SQL parameter batch and has interleaved
+// step orders. Every run must retain its own pin and ordered step evidence.
+func TestGetBranchSnapshotWholeInventory(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/test/repo", "origin", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRepo, err := d.InsertRepo("/test/other", "origin", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.sql.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	const count = 1100
+	for i := 0; i < count+2; i++ {
+		id := fmt.Sprintf("run-%04d", i)
+		repoID, branch := repo.ID, "feature"
+		if i == count {
+			branch = "other"
+		} else if i == count+1 {
+			repoID = otherRepo.ID
+		}
+		pin := fmt.Sprintf(`[{"name":"gate-%d","after":"review","command":"true"}]`, i)
+		if _, err := tx.Exec(`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at, gates_json) VALUES (?, ?, ?, 'head', 'base', 'running', ?, 1, ?)`, id, repoID, branch, i+1, pin); err != nil {
+			t.Fatal(err)
+		}
+		for _, order := range []int{2, 1} {
+			name := "test"
+			if order == 1 {
+				name = "review"
+			}
+			if _, err := tx.Exec(`INSERT INTO step_results (id, run_id, step_name, step_order, status, findings_json, approval_reason) VALUES (?, ?, ?, ?, 'completed', ?, ?)`, fmt.Sprintf("%s-%d", id, order), id, name, order, fmt.Sprintf("evidence-%d", i), fmt.Sprintf("reason-%d", i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	items, err := d.GetBranchSnapshot(context.Background(), repo.ID, "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != count {
+		t.Fatalf("inventory count = %d", len(items))
+	}
+	for index, item := range items {
+		i := count - 1 - index
+		id := fmt.Sprintf("run-%04d", i)
+		if item.Run.ID != id || item.GatesJSON != fmt.Sprintf(`[{"name":"gate-%d","after":"review","command":"true"}]`, i) || len(item.Steps) != 2 {
+			t.Fatalf("run %d: %#v", i, item)
+		}
+		for j, step := range item.Steps {
+			if step.RunID != id || step.StepOrder != j+1 || step.ApprovalReason == nil || *step.ApprovalReason != fmt.Sprintf("reason-%d", i) {
+				t.Fatalf("run %d step %d: %#v", i, j, step)
+			}
+			if index == 0 && step.StepName == types.StepTest {
+				if step.FindingsJSON == nil || *step.FindingsJSON != fmt.Sprintf("evidence-%d", i) {
+					t.Fatal("newest Test evidence lost")
+				}
+			} else if step.FindingsJSON != nil {
+				t.Fatal("evidence outside the newest Test sampled")
+			}
+		}
 	}
 }
 
@@ -180,7 +263,7 @@ func TestGetBranchSnapshotConsistentDuringWrites(t *testing.T) {
 				return
 			}
 			err = func() error {
-				if _, err := tx.Exec(`UPDATE runs SET head_sha = ? WHERE id = ?`, fmt.Sprint(i), r.ID); err != nil {
+				if _, err := tx.Exec(`UPDATE runs SET head_sha = ?, gates_json = ? WHERE id = ?`, fmt.Sprint(i), fmt.Sprintf(`[{"name":"generation-%d"}]`, i), r.ID); err != nil {
 					return err
 				}
 				if _, err := tx.Exec(`UPDATE step_results SET step_order = ? WHERE id = ?`, i, s.ID); err != nil {
@@ -213,7 +296,7 @@ func TestGetBranchSnapshotConsistentDuringWrites(t *testing.T) {
 			continue
 		}
 		generation := items[0].Steps[0].StepOrder
-		if items[0].Run.HeadSHA != fmt.Sprint(generation) || len(items) != 1+generation%2 {
+		if items[0].Run.HeadSHA != fmt.Sprint(generation) || items[0].GatesJSON != fmt.Sprintf(`[{"name":"generation-%d"}]`, generation) || len(items) != 1+generation%2 {
 			t.Fatalf("mixed snapshot: run=%s step=%d inventory=%d", items[0].Run.HeadSHA, generation, len(items))
 		}
 	}
